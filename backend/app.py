@@ -1,0 +1,812 @@
+import os
+import json
+import time
+import jwt
+import datetime
+import bcrypt
+from flask import Flask, request, jsonify, g, send_file
+from flask_cors import CORS
+from datetime import datetime, timedelta
+from pypdf import PdfReader
+from docx import Document
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+from functools import wraps
+import google.generativeai as genai
+
+load_dotenv()
+
+API_KEY = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=API_KEY, transport='rest')
+MONGO_URI = os.environ.get("MONGO_URI")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+
+app = Flask(__name__)
+CORS(app)
+
+# Database Setup
+client = MongoClient(MONGO_URI)
+db = client.get_database("hireready") # Default DB name
+users_collection = db.users
+analyses_collection = db.resume_analyses
+
+# JWT Helper
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(" ")[1]
+        
+        if not token:
+            return jsonify({'error': 'Token is missing!'}), 401
+        
+        try:
+            data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            current_user = users_collection.find_one({'_id': ObjectId(data['user_id'])})
+            if not current_user:
+                return jsonify({'error': 'User not found!'}), 401
+            # Add user info to global context
+            g.user = {'user_id': str(current_user['_id']), 'username': current_user['username']}
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired!'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token!'}), 401
+        except Exception as e:
+            return jsonify({'error': str(e)}), 401
+            
+        return f(*args, **kwargs)
+    return decorated
+
+def get_user_id_from_context():
+    return g.user.get('user_id') if g.user else None
+def extract_text_from_pdf(file_path):
+    text = ""
+    try:
+        reader = PdfReader(file_path)
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            
+            # Attempt to extract embedded links from annotations
+            try:
+                if "/Annots" in page:
+                    for annot in page["/Annots"]:
+                        obj = annot.get_object()
+                        if "/A" in obj and "/URI" in obj["/A"]:
+                            uri = obj["/A"]["/URI"]
+                            # Appending the link ensures the AI sees it even if it was hidden behind text
+                            page_text += f"\n[Embedded Link: {uri}]"
+            except Exception as e:
+                print(f"Warning: Could not extract annotations from page: {e}")
+
+            text += page_text + "\n"
+    except Exception as e:
+        print(f"Error reading PDF: {e}")
+        return None
+    return text.strip()
+
+def extract_text_from_docx(file_path):
+    text = ""
+    try:
+        document = Document(file_path)
+        for paragraph in document.paragraphs:
+            text += paragraph.text + "\n"
+    except Exception as e:
+        print(f"Error reading DOCX: {e}")
+        return None
+    return text.strip()
+
+
+@app.route("/")
+def health():
+    return {"status": "HireReady backend is live 🚀"}
+
+@app.route('/upload_file', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in the request."}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file."}), 400
+
+    filename = file.filename
+    temp_path = os.path.join('/tmp', filename) 
+    file.save(temp_path)
+    
+    extracted_text = ""
+    mime_type = file.mimetype
+    
+    try:
+        if mime_type == 'application/pdf':
+            extracted_text = extract_text_from_pdf(temp_path)
+        elif mime_type in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/msword']:
+            extracted_text = extract_text_from_docx(temp_path)
+        else:
+            return jsonify({"error": "Unsupported file type. Please upload a PDF or DOCX."}), 415
+
+        if not extracted_text:
+            return jsonify({"error": "Could not extract text from the file. Try copy/pasting instead."}), 500
+        
+        return jsonify({"extracted_text": extracted_text}), 200
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+@app.route('/signup', methods=['POST'])
+def signup():
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not all([username, email, password]):
+        return jsonify({"error": "Missing username, email, or password."}), 400
+
+    if users_collection.find_one({"$or": [{"email": email}, {"username": username}]}):
+        return jsonify({"error": "Username or Email already exists."}), 409
+    
+    try:
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+        
+        user_id = users_collection.insert_one({
+            "username": username,
+            "email": email,
+            "password_hash": hashed_password,
+            "created_at": datetime.utcnow()
+        }).inserted_id
+        
+        # Generate JWT
+        token = jwt.encode({
+            'user_id': str(user_id),
+            'exp': datetime.utcnow() + timedelta(days=7)
+        }, JWT_SECRET, algorithm="HS256")
+
+        return jsonify({
+            "message": "User created successfully.", 
+            "user_id": str(user_id), 
+            "username": username, 
+            "token": token
+        }), 201
+        
+    except Exception as e:
+        print(f"Error during signup: {e}")
+        return jsonify({"error": "Database error during signup."}), 500
+
+@app.route('/signin', methods=['POST'])
+def signin():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+
+    if not all([email, password]):
+        return jsonify({"error": "Missing email or password."}), 400
+
+    try:
+        user = users_collection.find_one({"email": email})
+        
+        if user and bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            # Generate JWT
+            token = jwt.encode({
+                'user_id': str(user['_id']),
+                'exp': datetime.utcnow() + timedelta(days=7)
+            }, JWT_SECRET, algorithm="HS256")
+            
+            return jsonify({
+                "message": "Sign in successful.", 
+                "user_id": str(user['_id']), 
+                "username": user['username'], 
+                "token": token
+            }), 200
+        else:
+            return jsonify({"error": "Invalid email or password."}), 401
+            
+    except Exception as e:
+        print(f"Error during signin: {e}")
+        return jsonify({"error": "Database error during signin."}), 500
+
+@app.route('/save_analysis', methods=['POST'])
+@token_required
+def save_analysis():
+    data = request.get_json()
+    user_id = get_user_id_from_context()
+    
+    analysis_result = data.get('analysis_result')
+    resume_text = data.get('resume_text', '')
+    job_description = data.get('job_description', '')
+    target_job_title = data.get('target_job_title', 'Untitled Analysis')
+    ats_score = analysis_result.get('ats_score', 0) if analysis_result else 0
+
+    if not analysis_result:
+        return jsonify({"error": "Missing analysis results to save."}), 400
+
+    try:
+        inserted = analyses_collection.insert_one({
+            "user_id": ObjectId(user_id),
+            "resume_text": resume_text,
+            "job_description": job_description,
+            "ats_score": ats_score,
+            "analysis_json": analysis_result,
+            "target_job_title": target_job_title,
+            "created_at": datetime.utcnow()
+        })
+        
+        return jsonify({"message": "Analysis saved successfully!", "id": str(inserted.inserted_id)}), 201
+        
+    except Exception as e:
+        print(f"Error during save: {e}")
+        return jsonify({"error": "Database error during save operation."}), 500
+
+@app.route('/get_history', methods=['POST'])
+@token_required
+def get_history():
+    user_id = get_user_id_from_context()
+    
+    try:
+        cursor = analyses_collection.find({"user_id": ObjectId(user_id)}).sort("created_at", -1)
+        history = []
+        for doc in cursor:
+            history.append({
+                "id": str(doc['_id']),
+                "ats_score": doc['ats_score'],
+                "target_job_title": doc.get('target_job_title', 'Untitled'),
+                "created_at": doc['created_at'].strftime('%Y-%m-%d %H:%M:%S'),
+                "resume_text": doc.get('resume_text', ''),
+                "job_description": doc.get('job_description', ''),
+                "analysis_json": doc.get('analysis_json', {})
+            })
+            
+        return jsonify({"history": history}), 200
+        
+    except Exception as e:
+        print(f"Error during history retrieval: {e}")
+        return jsonify({"error": "Database error during history retrieval."}), 500
+
+@app.route('/delete_analysis', methods=['POST'])
+@token_required
+def delete_analysis():
+    data = request.get_json()
+    draft_id = data.get('draft_id')
+    user_id = get_user_id_from_context()
+    
+    if not draft_id:
+        return jsonify({"error": "Draft ID is required."}), 400
+
+    try:
+        result = analyses_collection.delete_one({"_id": ObjectId(draft_id), "user_id": ObjectId(user_id)})
+        
+        if result.deleted_count == 0:
+             return jsonify({"error": "Draft not found or unauthorized."}), 404
+             
+        return jsonify({"message": "Draft deleted successfully!"}), 200
+        
+    except Exception as e:
+        print(f"Error during deletion: {e}")
+        return jsonify({"error": "Database error during deletion."}), 500
+
+ANALYSIS_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "ats_score": {
+            "type": "INTEGER",
+            "description": "A score from 1 to 100 representing the ATS and keyword match between the resume and the job description. Higher is better."
+        },
+        "feedback": {
+            "type": "OBJECT",
+            "properties": {
+                "keyword_gaps": {
+                    "type": "ARRAY",
+                    "description": "A list of critical skills or keywords from the job description that are missing or weakly present in the resume.",
+                    "items": {"type": "STRING"}
+                },
+                "keyword_strengths": {
+                    "type": "ARRAY",
+                    "description": "A list of skills or experiences from the resume that perfectly match the job description's requirements.",
+                    "items": {"type": "STRING"}
+                },
+                "content_improvements": {
+                    "type": "ARRAY",
+                    "description": "Actionable advice on improving the content and style (e.g., replace passive voice, quantify a specific bullet point, use stronger action verbs).",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "type": {"type": "STRING", "enum": ["improvement", "strength"]},
+                            "detail": {"type": "STRING", "description": "The specific advice or observation."}
+                        }
+                    }
+                },
+                "formatting_advice": {
+                    "type": "ARRAY",
+                    "description": "Suggestions on readability, length, and formatting (e.g., font consistency, section hierarchy, removing non-ATS friendly elements).",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "type": {"type": "STRING", "enum": ["improvement", "strength"]},
+                            "detail": {"type": "STRING", "description": "The specific advice or observation."}
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+BULLET_POINT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "job_title": {"type": "STRING", "description": "The professional job title used for context."},
+        "generated_bullets": {
+            "type": "ARRAY",
+            "description": "A list of three highly-polished, quantifiable, and action-oriented resume bullet points.",
+            "items": {"type": "STRING"}
+        }
+    }
+}
+
+SUGGESTION_SCHEMA = {
+    "type": "ARRAY",
+    "description": "A list of suggested bullet points, one for each skill gap.",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "skill": {"type": "STRING", "description": "The specific missing keyword/skill that this bullet addresses."},
+            "bullet": {"type": "STRING", "description": "A strong, quantifiable, and action-oriented bullet point suggestion on how to integrate this skill into the user's resume, based on common experience for the target job."}
+        }
+    }
+}
+
+TEMPLATE_OPTIONS = [
+    "Chronological/Traditional (Best for steady career progression)", 
+    "Functional/Skills-Based (Best for career changers or gap coverage)", 
+    "Hybrid/Combination (Best balance of skills and experience depth)", 
+    "Technical/Project-Focused (Best for engineers/developers)"
+]
+
+TEMPLATE_RECOMMENDATION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "best_template_type": {
+            "type": "STRING",
+            "description": "The single best-suited template from the options provided, e.g., 'Chronological/Traditional'."
+        },
+        "justification": {
+            "type": "STRING",
+            "description": "A 1-2 sentence explanation of why this template is the best match for the user's resume and the target job."
+        },
+        "available_templates": {
+            "type": "ARRAY",
+            "description": "The list of available templates, with a score and brief compatibility reason for each.",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "template_name": {"type": "STRING", "enum": TEMPLATE_OPTIONS},
+                    "compatibility_score": {"type": "INTEGER", "description": "Score from 1 to 100."},
+                    "reason": {"type": "STRING", "description": "1 sentence on why this template is a good/bad match."}
+                }
+            }
+        }
+    }
+}
+
+SECTION_REFINEMENT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "section_title": {"type": "STRING", "description": "The title of the section being refined (e.g., 'Experience', 'Summary')."},
+        "suggested_rewrites": {
+            "type": "ARRAY",
+            "description": "A list of suggested changes for the section.",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "original_text_snippet": {"type": "STRING", "description": "A short snippet (5-10 words) of the text being replaced/modified."},
+                    "suggested_bullet": {"type": "STRING", "description": "The new, refined, quantifiable, and keyword-rich bullet point or sentence."}
+                },
+                "propertyOrdering": ["original_text_snippet", "suggested_bullet"]
+            }
+        }
+    },
+    "propertyOrdering": ["section_title", "suggested_rewrites"]
+}
+
+RESUME_DATA_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "personal_info": {
+            "type": "OBJECT",
+            "properties": {
+                "full_name": {"type": "STRING"},
+                "email": {"type": "STRING"},
+                "phone": {"type": "STRING"},
+                "linkedin": {"type": "STRING"},
+                "portfolio": {"type": "STRING"}
+            }
+        },
+        "professional_summary": {"type": "STRING"},
+        "experience": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "job_title": {"type": "STRING"},
+                    "company": {"type": "STRING"},
+                    "start_date": {"type": "STRING"},
+                    "end_date": {"type": "STRING"},
+                    "description_bullets": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"}
+                    }
+                }
+            }
+        },
+        "education": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "degree": {"type": "STRING"},
+                    "school": {"type": "STRING"},
+                    "graduation_year": {"type": "STRING"}
+                }
+            }
+        },
+        "skills": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"}
+        }
+    }
+}
+
+def call_gemini_with_retry(payload, schema_name):
+    """
+    Calls the Gemini API using the google-generativeai SDK with exponential backoff.
+    Payload is expected to contain 'contents', 'systemInstruction', and 'generationConfig'.
+    """
+    max_retries = 3
+    retry_delay = 1
+    
+    # Extract params from the old payload structure to fit the SDK method signature
+    user_message = payload['contents'][0]['parts'][0]['text']
+    system_instruction = payload['systemInstruction']['parts'][0]['text']
+    generation_config = payload['generationConfig']
+    
+    model = genai.GenerativeModel(
+        model_name='gemini-2.0-flash-lite-preview-02-05',
+        system_instruction=system_instruction
+    )
+
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                user_message,
+                generation_config=generation_config
+            )
+            
+            # SDK returns a GenerateContentResponse object
+            # We need to extract the text and parse it as JSON
+            response_text = response.text
+            
+            # Clean up potential markdown code blocks
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+                
+            return json.loads(response_text)
+
+        except Exception as e:
+            print(f"Gemini SDK Error (Attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                print(f"API call failed after {max_retries} attempts.")
+                raise Exception(f"Failed to process LLM response: {e}")
+
+def call_gemini_analysis(resume_text, job_description):
+    system_prompt = (
+        "You are a world-class resume analyzer and Applicant Tracking System (ATS). "
+        "Your task is to compare the provided resume text against the target job description. "
+        "Generate a structured JSON response based ONLY on the provided schema. "
+        "The analysis must focus on ATS compatibility, keyword matching, and content quality (using action verbs and quantifiable results). "
+        "Be critical, specific, and actionable."
+    )
+    user_query = (
+        f"Analyze the following resume against the job description. "
+        f"Resume: ```{resume_text}```\n\n"
+        f"Job Description: ```{job_description}```\n\n"
+        f"Provide a structured analysis and an ATS score (1-100)."
+    )
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": ANALYSIS_SCHEMA
+        }
+    }
+    return call_gemini_with_retry(payload, "ANALYSIS_SCHEMA")
+
+def call_gemini_bullet_generator(job_title, task_description):
+    system_prompt = (
+        "You are a professional resume writer specializing in generating impactful, quantifiable, "
+        "and results-oriented bullet points. Use strong action verbs and metrics. "
+        "Your response MUST adhere strictly to the BULLET_POINT_SCHEMA."
+    )
+    user_query = (
+        f"Generate three unique, powerful resume bullet points for a candidate with the Job Title: '{job_title}' "
+        f"who performed the Task: '{task_description}'. Each bullet point should start with a strong action verb and include a quantifiable result."
+    )
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": BULLET_POINT_SCHEMA
+        }
+    }
+    return call_gemini_with_retry(payload, "BULLET_POINT_SCHEMA")
+
+def call_gemini_skill_suggester(resume_text, job_description, keyword_gaps):
+    system_prompt = (
+        "You are a strategic career advisor. For each skill listed in the 'keyword_gaps' array, "
+        "generate one highly-polished, quantifiable, and action-oriented bullet point that the user "
+        "could plausibly add to their resume to cover that specific skill, based on the general context of the "
+        "target job description. You MUST return a JSON array conforming to the SUGGESTION_SCHEMA. "
+        "Each bullet must clearly demonstrate how a project or experience could show that skill. "
+        "Do NOT use bullet points that are already present in the user's resume."
+    )
+    user_query = (
+        f"Target Job Description: ```{job_description}```\n\n"
+        f"User's Current Resume (for context/to avoid duplication): ```{resume_text}```\n\n"
+        f"CRITICAL MISSING SKILLS TO PROVIDE BULLET POINTS FOR: {', '.join(keyword_gaps)}\n\n"
+        f"For each missing skill, provide ONE suggested bullet point."
+    )
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": SUGGESTION_SCHEMA
+        }
+    }
+    return call_gemini_with_retry(payload, "SUGGESTION_SCHEMA")
+
+def call_gemini_template_selector(resume_text, job_description):
+    system_prompt = (
+        "You are a professional resume strategist. Recommend the best template structure "
+        "from the list provided that maximizes the user's appeal to an ATS and a recruiter "
+        "for the target job."
+    )
+    template_list_str = "\n".join([f"- {opt}" for opt in TEMPLATE_OPTIONS])
+    user_query = (
+        f"Available Templates:\n{template_list_str}\n\n"
+        f"Analyze the User's Resume:\n```{resume_text}```\n\n"
+        f"Against the Target Job Description:\n```{job_description}```\n\n"
+        f"Provide your structured recommendation based ONLY on the schema."
+    )
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": TEMPLATE_RECOMMENDATION_SCHEMA,
+            "temperature": 0.1
+        }
+    }
+    return call_gemini_with_retry(payload, "TEMPLATE_RECOMMENDATION_SCHEMA")
+
+def call_gemini_initial_draft(resume_text, job_description, analysis_result):
+    system_prompt = (
+        "You are an expert resume editor. Your task is to take the user's raw resume text "
+        "and the analysis feedback and produce a single, CLEAN, slightly optimized text draft. "
+        "Integrate the 'keyword_gaps' subtly, enhance the 'content_improvements' where possible, "
+        "and retain the overall structure. Do NOT add extra formatting (like HTML tags). "
+        "Return ONLY the modified resume text as a string inside a simple JSON object: {'modified_draft': '...'}."
+    )
+    
+    user_query = (
+        f"Raw Resume Text:\n```{resume_text}```\n\n"
+        f"Target Job Description:\n```{job_description}```\n\n"
+        f"Analysis Feedback to Incorporate:\n{json.dumps(analysis_result.get('feedback', {}), indent=2)}\n\n"
+        f"Produce the single, clean, modified resume text."
+    )
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": {"type": "OBJECT", "properties": {"modified_draft": {"type": "STRING"}}},
+            "temperature": 0.3
+        }
+    }
+    return call_gemini_with_retry(payload, "INITIAL_DRAFT_SCHEMA")
+
+def call_gemini_section_refiner(section_text, job_description):
+    system_prompt = (
+        "You are a hyper-specific resume refinement tool. For the provided resume section, "
+        "generate 2-3 precise, quantifiable, and keyword-rich rewrite suggestions for the "
+        "existing bullet points or sentences, focusing entirely on the target job description. "
+        "Ensure the suggestions are action-verb focused and metric-driven. "
+        "Return ONLY the structured JSON object."
+    )
+    
+    user_query = (
+        f"Target Job Description (for context):\n```{job_description}```\n\n"
+        f"Resume Section Text to Refine:\n```{section_text}```\n\n"
+        f"Generate structured rewrite suggestions."
+    )
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": SECTION_REFINEMENT_SCHEMA,
+            "temperature": 0.5
+        }
+    }
+    return call_gemini_with_retry(payload, "SECTION_REFINEMENT_SCHEMA")
+
+def call_gemini_parser(resume_text):
+    system_prompt = (
+        "You are a precise data extraction engine. Your job is to parse the provided resume text "
+        "into a structured JSON format according to the schema. "
+        "Extract every detail accurately. If a field is missing, leave it as an empty string or empty array."
+    )
+    user_query = f"Parse this resume text into JSON:\n\n```{resume_text}```"
+    
+    payload = {
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": RESUME_DATA_SCHEMA,
+            "temperature": 0.1
+        }
+    }
+    return call_gemini_with_retry(payload, "RESUME_DATA_SCHEMA")
+
+@app.route('/analyze_resume', methods=['POST'])
+def analyze_resume():
+    try:
+        data = request.get_json()
+        resume_text = data.get('resume', '')
+        job_description = data.get('job_description', '')
+
+        if not resume_text or not job_description:
+            return jsonify({"error": "Both resume and job description are required."}), 400
+
+        analysis_result = call_gemini_analysis(resume_text, job_description)
+        return jsonify(analysis_result), 200
+
+    except Exception as e:
+        print(f"An error occurred during analysis: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+@app.route('/generate_bullet_points', methods=['POST'])
+def generate_bullet_points():
+    try:
+        data = request.get_json()
+        job_title = data.get('job_title', '').strip()
+        task_description = data.get('task_description', '').strip()
+
+        if not job_title or not task_description:
+            return jsonify({"error": "Both job title and task description are required."}), 400
+
+        generation_result = call_gemini_bullet_generator(job_title, task_description)
+        return jsonify(generation_result), 200
+
+    except Exception as e:
+        print(f"An error occurred during bullet generation: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+@app.route('/suggest_skill_bullets', methods=['POST'])
+def suggest_skill_bullets():
+    try:
+        data = request.get_json()
+        resume_text = data.get('resume', '')
+        job_description = data.get('job_description', '')
+        keyword_gaps = data.get('keyword_gaps', [])
+
+        if not resume_text or not job_description or not keyword_gaps:
+            return jsonify({"error": "Resume, job description, and keyword gaps are required for targeted suggestions."}), 400
+
+        generation_result = call_gemini_skill_suggester(resume_text, job_description, keyword_gaps)
+        return jsonify({"suggestions": generation_result}), 200
+
+    except Exception as e:
+        print(f"An error occurred during skill suggestion generation: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+@app.route('/recommend_template', methods=['POST'])
+def recommend_template():
+    try:
+        data = request.get_json()
+        resume_text = data.get('resume', '')
+        job_description = data.get('job_description', '')
+
+        if not resume_text or not job_description:
+            return jsonify({"error": "Both resume and job description are required."}), 400
+
+        recommendations = call_gemini_template_selector(resume_text, job_description)
+        return jsonify(recommendations), 200
+
+    except Exception as e:
+        print(f"An error occurred during template recommendation: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+@app.route('/generate_initial_draft', methods=['POST'])
+def generate_initial_draft():
+    try:
+        data = request.get_json()
+        resume_text = data.get('resume', '')
+        job_description = data.get('job_description', '')
+        analysis_result = data.get('analysis_result', {})
+
+        if not resume_text or not job_description or not analysis_result:
+            return jsonify({"error": "Resume, JD, and Analysis are required."}), 400
+
+        draft_result = call_gemini_initial_draft(resume_text, job_description, analysis_result)
+        return jsonify(draft_result), 200
+
+    except Exception as e:
+        print(f"An error occurred during draft generation: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+@app.route('/refine_section', methods=['POST'])
+def refine_section():
+    try:
+        data = request.get_json()
+        section_text = data.get('section_text', '')
+        job_description = data.get('job_description', '')
+
+        if not section_text or not job_description:
+            return jsonify({"error": "Section text and job description are required."}), 400
+
+        refinement_result = call_gemini_section_refiner(section_text, job_description)
+        return jsonify(refinement_result), 200
+
+    except Exception as e:
+        print(f"An error occurred during section refinement: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+@app.route('/parse_resume_to_json', methods=['POST'])
+def parse_resume_to_json():
+    try:
+        data = request.get_json()
+        resume_text = data.get('resume', '')
+
+        if not resume_text:
+            return jsonify({"error": "Resume text is required."}), 400
+
+        parsed_data = call_gemini_parser(resume_text)
+        return jsonify(parsed_data), 200
+
+    except Exception as e:
+        print(f"An error occurred during resume parsing: {e}")
+        return jsonify({"error": f"AI Server Error: {str(e)}"}), 500
+
+if __name__ == "__main__":
+    port = 5000
+    if os.getenv("FLASK_ENV") == "production":
+        port = int(os.environ.get("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
+
+
